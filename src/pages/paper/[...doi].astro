@@ -1,0 +1,277 @@
+---
+/**
+ * AcademicCite 核心动态路由
+ * 运行于 Cloudflare Workers Edge，强制 SSR（prerender = false）
+ * 使用 KV 缓存 30 天，确保近零边际成本
+ */
+export const prerender = false;
+
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import PaperSidebar from '../../components/PaperSidebar.astro';
+import { reconstructAbstract, extractTakeaways } from '../../utils/abstract.js';
+import { formatAPA, formatIEEE, formatMLA } from '../../utils/citations.js';
+import { normalizeDoi, buildApiUrls } from '../../utils/paper.js';
+
+// -------------------------------------------------------
+// 1. 提取并规范化 DOI
+// -------------------------------------------------------
+const rawDoi = Astro.params.doi;
+const doi = normalizeDoi(rawDoi);
+
+if (!doi) {
+  return new Response('Invalid DOI', { status: 400 });
+}
+
+const cacheKey = `paper:v1:${doi}`;
+const KV = Astro.locals.runtime?.env?.ACADEMIC_CACHE;
+
+// -------------------------------------------------------
+// 2. 检查 Edge KV 缓存
+// -------------------------------------------------------
+let paperData = null;
+let fromCache = false;
+
+if (KV) {
+  try {
+    const cached = await KV.get(cacheKey, { type: 'json' });
+    if (cached && cached.work) {
+      paperData = cached;
+      fromCache = true;
+    }
+  } catch (e) {
+    // 缓存读取失败不阻断主流程
+    console.error('KV read error:', e);
+  }
+}
+
+// -------------------------------------------------------
+// 3. 缓存未命中：并发请求 OpenAlex + Unpaywall
+// -------------------------------------------------------
+if (!paperData) {
+  const { openAlex, unpaywall } = buildApiUrls(doi);
+
+  const [oaRes, upRes] = await Promise.all([
+    fetch(openAlex, {
+      headers: {
+        'User-Agent': 'AcademicCite/1.0 (mailto:api-agent@academiccite.com)',
+        Accept: 'application/json'
+      }
+    }),
+    fetch(unpaywall, {
+      headers: {
+        Accept: 'application/json'
+      }
+    })
+  ]);
+
+  // OpenAlex 404 → 直接返回原生 404
+  if (oaRes.status === 404) {
+    return new Response('Paper not found in OpenAlex', { status: 404 });
+  }
+
+  if (!oaRes.ok) {
+    return new Response(`OpenAlex error: ${oaRes.status}`, { status: 502 });
+  }
+
+  const work = await oaRes.json();
+  let unpaywallData = null;
+  if (upRes.ok) {
+    try {
+      unpaywallData = await upRes.json();
+    } catch (_) {}
+  }
+
+  // 还原摘要
+  const abstract = reconstructAbstract(work.abstract_inverted_index);
+
+  // 组装精简数据（只缓存必要字段，控制 KV 体积）
+  paperData = {
+    work: {
+      id: work.id,
+      doi: work.doi,
+      title: work.title,
+      publication_year: work.publication_year,
+      cited_by_count: work.cited_by_count || 0,
+      authorships: (work.authorships || []).map(a => ({
+        author: { display_name: a.author?.display_name || '' }
+      })),
+      primary_location: work.primary_location
+        ? {
+            source: { display_name: work.primary_location.source?.display_name || '' },
+            landing_page_url: work.primary_location.landing_page_url || null
+          }
+        : null,
+      biblio: work.biblio || {},
+      abstract_inverted_index: null // 不再重复存储
+    },
+    abstract,
+    unpaywall: unpaywallData
+      ? {
+          is_oa: !!unpaywallData.is_oa,
+          best_oa_location: unpaywallData.best_oa_location
+            ? { url_for_pdf: unpaywallData.best_oa_location.url_for_pdf || null }
+            : null,
+          doi_url: unpaywallData.doi_url || null
+        }
+      : null,
+    cached_at: new Date().toISOString()
+  };
+
+  // 写入 KV，TTL = 30 天
+  if (KV) {
+    try {
+      await KV.put(cacheKey, JSON.stringify(paperData), {
+        expirationTtl: 2592000 // 30 days
+      });
+    } catch (e) {
+      console.error('KV write error:', e);
+    }
+  }
+}
+
+// -------------------------------------------------------
+// 4. 派生渲染数据
+// -------------------------------------------------------
+const work = paperData.work;
+const abstract = paperData.abstract || '';
+const takeaways = extractTakeaways(abstract);
+const isOa = paperData.unpaywall?.is_oa === true;
+const pdfUrl = paperData.unpaywall?.best_oa_location?.url_for_pdf || null;
+const publisherUrl = work.primary_location?.landing_page_url || paperData.unpaywall?.doi_url || `https://doi.org/${doi}`;
+
+const apa = formatAPA(work);
+const ieee = formatIEEE(work);
+const mla = formatMLA(work);
+
+const authors = (work.authorships || [])
+  .map(a => a.author?.display_name)
+  .filter(Boolean);
+
+const journal = work.primary_location?.source?.display_name || 'Unknown Journal';
+const year = work.publication_year || null;
+const citedBy = work.cited_by_count || 0;
+
+// 爬取预算控制：0 引用且发表超过 3 年 → noindex
+const currentYear = new Date().getFullYear();
+const isOldZeroCite = citedBy === 0 && year !== null && year <= currentYear - 3;
+const robots = isOldZeroCite ? 'noindex, follow' : 'index, follow';
+
+// ScholarlyArticle JSON-LD
+const jsonLd = {
+  '@context': 'https://schema.org',
+  '@type': 'ScholarlyArticle',
+  headline: work.title || '',
+  author: authors.map(name => ({
+    '@type': 'Person',
+    name
+  })),
+  datePublished: year ? String(year) : undefined,
+  isPartOf: {
+    '@type': 'Periodical',
+    name: journal
+  },
+  identifier: {
+    '@type': 'PropertyValue',
+    propertyID: 'DOI',
+    value: doi
+  },
+  url: `https://doi.org/${doi}`,
+  citation: citedBy > 0 ? {
+    '@type': 'CreativeWork',
+    name: `${citedBy} citations`
+  } : undefined
+};
+
+const pageTitle = work.title
+  ? `${work.title} | AcademicCite`
+  : `DOI ${doi} | AcademicCite`;
+---
+
+<BaseLayout title={pageTitle} robots={robots} jsonLd={jsonLd}>
+  <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:py-12">
+    <!-- 响应式双栏：左侧 70% / 右侧 30% -->
+    <div class="grid grid-cols-1 lg:grid-cols-10 gap-8 lg:gap-10">
+      
+      <!-- 左侧主内容 -->
+      <main class="lg:col-span-7 space-y-6">
+        <Breadcrumbs doi={doi} title={work.title || doi} />
+
+        <header>
+          <h1 class="text-2xl sm:text-3xl font-bold text-academic-slate-900 leading-tight tracking-tight">
+            {work.title || 'Untitled Paper'}
+          </h1>
+
+          <!-- 作者列表 -->
+          {authors.length > 0 && (
+            <p class="mt-3 text-academic-slate-600 text-sm sm:text-base leading-relaxed">
+              {authors.join(', ')}
+            </p>
+          )}
+
+          <!-- 期刊 + 引用徽章 -->
+          <div class="mt-4 flex flex-wrap items-center gap-3">
+            <span class="text-sm font-medium text-academic-slate-700 bg-academic-slate-100 px-3 py-1 rounded-full">
+              {journal}
+            </span>
+            {year && (
+              <span class="text-sm text-academic-slate-500">{year}</span>
+            )}
+            <span class="inline-flex items-center gap-1.5 text-sm font-semibold text-academic-indigo-700 bg-academic-indigo-50 px-3 py-1 rounded-full">
+              <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path d="M9 2a1 1 0 000 2h2a1 1 0 100-2H9z"/><path fill-rule="evenodd" d="M4 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm3 4a1 1 0 000 2h.01a1 1 0 100-2H7zm3 0a1 1 0 000 2h3a1 1 0 100-2h-3zm-3 4a1 1 0 100 2h.01a1 1 0 100-2H7zm3 0a1 1 0 100 2h3a1 1 0 100-2h-3z" clip-rule="evenodd"/></svg>
+              {citedBy.toLocaleString()} Citations
+            </span>
+          </div>
+        </header>
+
+        <!-- AI 3-Bullet Takeaways -->
+        {takeaways.length > 0 && (
+          <section class="rounded-xl border border-academic-indigo-100 bg-academic-indigo-50/60 p-5">
+            <h2 class="text-sm font-semibold text-academic-indigo-800 uppercase tracking-wide mb-3">
+              Key Takeaways
+            </h2>
+            <ul class="space-y-2.5">
+              {takeaways.map(t => (
+                <li class="flex gap-2.5 text-sm text-academic-slate-800 leading-relaxed">
+                  <span class="mt-1.5 w-1.5 h-1.5 rounded-full bg-academic-indigo-500 flex-shrink-0"></span>
+                  <span>{t}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
+        <!-- 摘要 -->
+        {abstract && (
+          <section>
+            <h2 class="text-lg font-semibold text-academic-slate-900 mb-3">Abstract</h2>
+            <div class="prose prose-slate max-w-none text-academic-slate-700 leading-relaxed text-[15px]">
+              <p>{abstract}</p>
+            </div>
+          </section>
+        )}
+
+        <!-- 底部 DOI 与缓存状态（调试友好） -->
+        <footer class="pt-6 border-t border-academic-slate-200 text-xs text-academic-slate-400 flex flex-wrap gap-4">
+          <span>DOI: <a href={`https://doi.org/${doi}`} class="text-academic-indigo-600 hover:underline" target="_blank" rel="noopener">{doi}</a></span>
+          <span>Source: OpenAlex + Unpaywall</span>
+          {fromCache && <span class="text-academic-emerald-600">Served from Edge Cache</span>}
+        </footer>
+      </main>
+
+      <!-- 右侧边栏 -->
+      <div class="lg:col-span-3">
+        <div class="lg:sticky lg:top-8">
+          <PaperSidebar
+            isOa={isOa}
+            pdfUrl={pdfUrl}
+            publisherUrl={publisherUrl}
+            apa={apa}
+            ieee={ieee}
+            mla={mla}
+          />
+        </div>
+      </div>
+    </div>
+  </div>
+</BaseLayout>
