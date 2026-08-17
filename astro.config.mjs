@@ -4,11 +4,12 @@ import tailwind from '@astrojs/tailwind';
 
 /**
  * AcademicCite 生产配置
- * - hybrid 模式：静态页面预渲染，动态 DOI 路由强制 SSR
- * - Cloudflare adapter 直接输出 Workers 兼容产物
+ * - 使用 output: 'static'（Astro 新版本已移除 hybrid）
+ * - 需要 SSR 的页面通过 export const prerender = false 单独开启
+ * - Cloudflare adapter 继续负责边缘运行时
  */
 export default defineConfig({
-  output: 'hybrid',
+  output: 'static',
   adapter: cloudflare({
     platformProxy: {
       enabled: true
@@ -19,7 +20,6 @@ export default defineConfig({
       applyBaseStyles: false
     })
   ],
-  // 确保动态路由不被预渲染
   vite: {
     ssr: {
       external: ['node:buffer']
