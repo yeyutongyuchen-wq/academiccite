@@ -1,0 +1,9 @@
+name = "academiccite"
+compatibility_date = "2025-01-01"
+pages_build_output_dir = "dist"
+
+# KV 命名空间绑定（生产环境请替换为真实 ID）
+[[kv_namespaces]]
+binding = "ACADEMIC_CACHE"
+id = "your-production-kv-id-here"
+preview_id = "your-preview-kv-id-here"
