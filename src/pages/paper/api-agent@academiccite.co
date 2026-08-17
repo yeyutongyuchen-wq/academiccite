@@ -54,7 +54,7 @@ if (!paperData) {
   const [oaRes, upRes] = await Promise.all([
     fetch(openAlex, {
       headers: {
-        'User-Agent': 'AcademicCite/1.0 (mailto:api-agent@academiccite.com)',
+        'User-Agent': 'AcademicCite/1.0 (mailto:yeyutongyuchen@gmail.com)',
         Accept: 'application/json'
       }
     }),
