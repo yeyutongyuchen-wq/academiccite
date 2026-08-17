@@ -71,8 +71,17 @@ if (!paperData) {
   }
 
   if (!oaRes.ok) {
-    return new Response(`OpenAlex error: ${oaRes.status}`, { status: 502 });
+  if (oaRes.status === 429) {
+    return new Response(
+      'OpenAlex is currently rate-limiting requests. Please wait 1–2 minutes and try again, or test with a different DOI.',
+      { 
+        status: 429,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+      }
+    );
   }
+  return new Response(`OpenAlex error: ${oaRes.status}`, { status: 502 });
+}
 
   const work = await oaRes.json();
   let unpaywallData = null;
