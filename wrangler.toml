@@ -6,4 +6,4 @@ pages_build_output_dir = "dist"
 # 这里仅保留兼容性声明，不写入无效 ID
 # [[kv_namespaces]]
 # binding = "ACADEMIC_CACHE"
-# id = ""
+# id = "67d06270b11342738d6d12dff2ceaae9"
