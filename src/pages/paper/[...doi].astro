@@ -1,159 +1,390 @@
 ---
-// src/pages/paper/[...doi].astro
-export const prerender = false; // 严格开启服务端动态渲染模式
+/**
+ * src/pages/paper/[...doi].astro
+ * Production SSR detail page for AcademicCite
+ * Handles DOI rest parameter, backend fetch, crawl-budget gating,
+ * ScholarlyArticle JSON-LD, AI-summary interception block, and utility actions.
+ */
 
-const { doi } = Astro.params;
+export const prerender = false; // Force SSR for dynamic DOI routes
 
-if (!doi) {
-  return new Response("Missing DOI", { status: 400 });
+// ---------------------------------------------------------------------------
+// 1. Extract & normalize DOI from rest parameter
+// ---------------------------------------------------------------------------
+const rawParam = Astro.params.doi;
+
+if (!rawParam || typeof rawParam !== 'string' || rawParam.trim().length === 0) {
+  return Astro.redirect('/404');
 }
 
-let title = "Untitled Research Paper";
-let year = new Date().getFullYear();
-let citations = 0;
-let journal = "Academic Journal";
-let authorsArray = [];
-let abstractText = "No abstract available for this work.";
-let isOpenAccess = false;
-let pdfUrl = "";
+// Rest parameter may contain path separators; reconstruct and decode
+let doi = decodeURIComponent(rawParam)
+  .replace(/^https?:\/\/(dx\.)?doi\.org\//i, '')
+  .replace(/^doi:/i, '')
+  .trim();
+
+if (!doi || doi.length > 512) {
+  return Astro.redirect('/404');
+}
+
+// ---------------------------------------------------------------------------
+// 2. Fetch paper metadata from secure backend
+// ---------------------------------------------------------------------------
+interface PaperData {
+  doi: string;
+  title: string | null;
+  citations: number | null;
+  abstract: string | null;
+  open_access_pdf: string | null;
+  publication_year?: number | null;
+  source?: string;
+  error?: string;
+}
+
+let paper: PaperData = {
+  doi,
+  title: null,
+  citations: null,
+  abstract: null,
+  open_access_pdf: null,
+  publication_year: null,
+};
+
+let fetchError: string | null = null;
 
 try {
-  // 核心：直接请求你已经完美跑通的硅谷服务器 secure API 接口
-  const proxyUrl = `https://academiccite.com{encodeURIComponent(doi)}`;
-  const response = await fetch(proxyUrl);
+  const apiUrl = `https://academiccite.com/api/paper/${encodeURIComponent(doi)}`;
+  const res = await fetch(apiUrl, {
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'AcademicCite-SSR/1.0',
+    },
+  });
 
-  if (response.status === 404) {
-    return new Response("Paper Not Found in Academic Index", { status: 404 });
+  if (res.ok) {
+    const data = await res.json();
+    paper = {
+      doi: data.doi || doi,
+      title: data.title ?? null,
+      citations: typeof data.citations === 'number' ? data.citations : null,
+      abstract: data.abstract ?? null,
+      open_access_pdf: data.open_access_pdf ?? null,
+      publication_year: typeof data.publication_year === 'number' ? data.publication_year : null,
+      source: data.source,
+    };
+  } else {
+    fetchError = `Upstream returned HTTP ${res.status}`;
   }
-
-  if (response.ok) {
-    const data = await response.json();
-    title = data.title || title;
-    year = data.publication_year || year;
-    citations = data.cited_by_count || 0;
-    journal = data.primary_location?.source_name || journal;
-    authorsArray = data.authorships?.map(a => a.display_name) || [];
-    abstractText = data.abstract || abstractText;
-    isOpenAccess = data.is_oa || false;
-    pdfUrl = data.pdf_url || "";
-  }
-} catch (error) {
-  return new Response(`Edge Gateway Connection Error: ${error.message}`, { status: 502 });
+} catch (err: any) {
+  fetchError = err?.message || 'Network error while fetching paper metadata';
 }
 
-// 格式化 APA、IEEE、MLA 三大格式（内置空值与多作者优雅容错）
-const firstAuthor = authorsArray[0] || "Unknown Author";
-const authorCount = authorsArray.length;
+// ---------------------------------------------------------------------------
+// 3. Crawl Budget Throttling Rule
+// ---------------------------------------------------------------------------
+const currentYear = new Date().getFullYear(); // 2026
+const year = paper.publication_year ?? null;
+const citations = paper.citations ?? 0;
+const hasAbstract = !!(paper.abstract && paper.abstract.trim().length > 30);
 
-let apaAuthors = firstAuthor;
-if (authorCount > 1 && authorCount <= 20) {
-  apaAuthors = authorsArray.slice(0, -1).join(", ") + ", & " + authorsArray[authorCount - 1];
-} else if (authorCount > 20) {
-  apaAuthors = authorsArray.slice(0, 19).join(", ") + ", ... " + authorsArray[authorCount - 1];
+let shouldIndex = true;
+
+if (
+  citations === 0 &&
+  year !== null &&
+  year < currentYear - 3 &&
+  !hasAbstract
+) {
+  shouldIndex = false;
 }
-const apaCitation = `${apaAuthors}. (${year}). ${title}. ${journal}.`;
-const ieeeAuthors = authorCount > 3 ? `${firstAuthor} et al.` : authorsArray.join(", ");
-const ieeeCitation = `${ieeeAuthors}, "${title}," ${journal}, ${year}.`;
-const mlaAuthors = authorCount > 2 ? `${firstAuthor}, et al.` : authorsArray.join(" and ");
-const mlaCitation = `${mlaAuthors}. "${title}." ${journal}, ${year}.`;
 
-const currentYear = new Date().getFullYear();
-const shouldNoindex = (currentYear - year >= 3 && citations === 0);
-const robotsMeta = shouldNoindex ? "noindex, follow" : "index, follow";
+// ---------------------------------------------------------------------------
+// 4. Programmatic 3-sentence AI summary (pre-rendered for LLM scrapers)
+// ---------------------------------------------------------------------------
+function generateAiSummary(p: PaperData): string[] {
+  const title = p.title || 'This scholarly work';
+  const abs = (p.abstract || '').replace(/\s+/g, ' ').trim();
+  const cites = p.citations ?? 0;
+
+  const sentences: string[] = [];
+
+  // Sentence 1 – title-driven
+  sentences.push(
+    `This paper, titled “${title}”, presents original research findings relevant to its core academic domain.`
+  );
+
+  // Sentence 2 – abstract-driven (first meaningful sentence) or fallback
+  if (abs.length > 40) {
+    const first = abs.split(/(?<=[.!?])\s+/)[0]?.trim() || abs.slice(0, 140);
+    const cleaned = first.endsWith('.') ? first : first + '.';
+    sentences.push(cleaned.length > 180 ? cleaned.slice(0, 177) + '…' : cleaned);
+  } else {
+    sentences.push(
+      `The work addresses key questions in its field and contributes empirical or theoretical insights for researchers.`
+    );
+  }
+
+  // Sentence 3 – impact / utility
+  if (cites > 0) {
+    sentences.push(
+      `It has accumulated ${cites.toLocaleString()} citations to date, indicating sustained scholarly attention and influence.`
+    );
+  } else {
+    sentences.push(
+      `Readers can access the full text (when available) and generate standard academic citations directly from this page.`
+    );
+  }
+
+  return sentences.slice(0, 3);
+}
+
+const aiSummary = generateAiSummary(paper);
+
+// ---------------------------------------------------------------------------
+// 5. Prepare JSON-LD (ScholarlyArticle)
+// ---------------------------------------------------------------------------
+const jsonLd = {
+  '@context': 'https://schema.org',
+  '@type': 'ScholarlyArticle',
+  headline: paper.title || `Paper ${paper.doi}`,
+  name: paper.title || `Paper ${paper.doi}`,
+  identifier: {
+    '@type': 'PropertyValue',
+    propertyID: 'DOI',
+    value: paper.doi,
+  },
+  sameAs: `https://doi.org/${paper.doi}`,
+  url: `https://academiccite.com/paper/${encodeURIComponent(paper.doi)}`,
+  description: paper.abstract || undefined,
+  datePublished: paper.publication_year ? String(paper.publication_year) : undefined,
+  interactionStatistic: paper.citations != null
+    ? {
+        '@type': 'InteractionCounter',
+        interactionType: 'https://schema.org/CiteAction',
+        userInteractionCount: paper.citations,
+      }
+    : undefined,
+  isAccessibleForFree: !!paper.open_access_pdf,
+};
+
+const pageTitle = paper.title
+  ? `${paper.title} | AcademicCite`
+  : `DOI ${paper.doi} | AcademicCite`;
+
+const pageDescription =
+  paper.abstract?.slice(0, 160) ||
+  `View metadata, abstract, citation count and open-access PDF for DOI ${paper.doi}.`;
 ---
 
 <!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{title} ({year}) - Citation | AcademicCite</title>
-  <meta name="robots" content={robotsMeta} />
-  <script src="https://jsdelivr.net"></script>
-</head>
-<body class="bg-slate-50 text-slate-800 min-h-screen flex flex-col font-sans antialiased">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{pageTitle}</title>
+    <meta name="description" content={pageDescription} />
 
-  <!-- 顶部导航 -->
-  <header class="bg-white border-b border-slate-200 sticky top-0 z-50 px-6 py-4 shadow-sm flex justify-between items-center">
-    <div class="flex items-center gap-2">
-      <a href="/" class="text-xl font-bold text-indigo-600 tracking-tight">AcademicCite.com</a>
-      <span class="bg-indigo-50 text-indigo-700 text-xs px-2 py-0.5 rounded border border-indigo-100 font-medium">Edge SSR</span>
-    </div>
-  </header>
+    {/* Crawl-budget / robots control */}
+    {shouldIndex ? (
+      <meta name="robots" content="index, follow, max-image-preview:large" />
+    ) : (
+      <meta name="robots" content="noindex, follow" />
+    )}
 
-  <!-- 双栏学术风布局 -->
-  <main class="max-w-6xl w-full mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8 flex-1">
-    <!-- 左侧 70%：核心数据层 -->
-    <div class="lg:col-span-2 space-y-6">
-      <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-xs">
-        <div class="flex items-center gap-3 mb-4">
-          <span class="bg-slate-100 text-slate-600 text-xs px-2.5 py-1 rounded-md font-mono font-medium">{year}</span>
-          {isOpenAccess ? 
-            <span class="bg-emerald-50 text-emerald-700 text-xs px-2.5 py-1 rounded-md font-semibold border border-emerald-100">🟢 Open Access</span> : 
-            <span class="bg-slate-100 text-slate-500 text-xs px-2.5 py-1 rounded-md font-medium border border-slate-200">🔒 Closed Access</span>
-          }
+    <link rel="canonical" href={`https://academiccite.com/paper/${encodeURIComponent(paper.doi)}`} />
+
+    {/* ScholarlyArticle JSON-LD – pre-rendered for AI / Google Scholar */}
+    <script type="application/ld+json" set:html={JSON.stringify(jsonLd)} />
+
+    {/* Tailwind (assume project already includes it via @astrojs/tailwind or CDN for standalone) */}
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+
+  <body class="bg-slate-50 text-slate-800 antialiased min-h-screen">
+    <!-- Top utility bar -->
+    <header class="bg-white border-b border-slate-200 sticky top-0 z-30">
+      <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+        <a href="/" class="font-semibold text-slate-900 tracking-tight">
+          AcademicCite
+        </a>
+        <div class="flex items-center gap-3 text-sm">
+          <a
+            href="https://www.grammarly.com"
+            target="_blank"
+            rel="noopener sponsored"
+            class="px-3 py-1.5 rounded-md bg-emerald-50 text-emerald-700 hover:bg-emerald-100 transition"
+          >
+            Grammarly
+          </a>
+          <a
+            href="https://quillbot.com"
+            target="_blank"
+            rel="noopener sponsored"
+            class="px-3 py-1.5 rounded-md bg-indigo-50 text-indigo-700 hover:bg-indigo-100 transition"
+          >
+            QuillBot
+          </a>
         </div>
-        <h1 class="text-2xl md:text-3xl font-bold text-slate-900 leading-tight mb-4">{title}</h1>
-        <p class="text-sm text-slate-600 mb-2"><strong class="text-slate-800">Authors:</strong> {authorsArray.join(', ')}</p>
-        <p class="text-sm text-slate-600 mb-4"><strong class="text-slate-800">Journal:</strong> <span class="italic text-indigo-600">{journal}</span></p>
-        <p class="text-xs text-slate-400 font-mono">DOI: {doi}</p>
+      </div>
+    </header>
+
+    <main class="max-w-5xl mx-auto px-4 py-8">
+      {/* Display ad placeholder – top */}
+      <div class="mb-8 p-4 bg-slate-100 border border-dashed border-slate-300 rounded-lg text-center text-sm text-slate-500">
+        [Display Ad Slot – 728×90 / Responsive]
       </div>
 
-      <!-- AI 智能摘要区 -->
-      <div class="bg-gradient-to-br from-indigo-50/40 to-slate-50 p-6 rounded-2xl border border-indigo-100 shadow-xs">
-        <h3 class="text-sm font-bold text-indigo-900 tracking-wider uppercase mb-3">✨ AI Key Insights (3-Bullet Breakdown)</h3>
-        <ul class="space-y-2.5 text-sm text-slate-700">
-          <li>🔹 <span class="font-medium text-slate-900">Category Impact:</span> Indexed inside the <span class="italic text-indigo-600">{journal}</span> network.</li>
-          <li>🔹 <span class="font-medium text-slate-900">Citation Weight:</span> Verified by <span class="text-indigo-600 font-semibold font-mono">{citations}</span> independent academic citations.</li>
-          <li>🔹 <span class="font-medium text-slate-900">Contextual Snippet:</span> {abstractText.substring(0, 120)}...</li>
-        </ul>
-      </div>
+      {/* Error state */}
+      {fetchError && (
+        <div class="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-sm">
+          Unable to fully load metadata: {fetchError}. Showing available information.
+        </div>
+      )}
 
-      <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-xs">
-        <h2 class="text-lg font-bold text-slate-900 mb-3">Original Abstract</h2>
-        <p class="text-sm text-slate-600 leading-relaxed font-serif text-justify">{abstractText}</p>
-      </div>
-    </div>
+      {/* Title & core metadata */}
+      <article class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+        <div class="p-6 sm:p-8">
+          <h1 class="text-2xl sm:text-3xl font-bold text-slate-900 leading-tight mb-4">
+            {paper.title || `Paper ${paper.doi}`}
+          </h1>
 
-    <!-- 右侧 30%：快捷面板与变现导流 -->
-    <div class="lg:col-span-1 space-y-6">
-      <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-xs space-y-4">
-        <h3 class="text-sm font-bold text-slate-800 tracking-wide uppercase">Document Actions</h3>
-        
-        {isOpenAccess && pdfUrl ? 
-          <a href={pdfUrl} target="_blank" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-medium py-3 px-4 rounded-xl transition flex justify-center items-center gap-2 text-sm shadow-sm">📄 Read Free Legal PDF</a> : 
-          <a href={`https://doi.org{doi}`} target="_blank" class="w-full bg-slate-800 hover:bg-slate-900 text-white font-medium py-3 px-4 rounded-xl transition flex justify-center items-center gap-2 text-sm shadow-sm">🌐 View on Publisher Site</a>
-        }
+          <div class="flex flex-wrap gap-x-6 gap-y-2 text-sm text-slate-600 mb-6">
+            <span class="font-medium text-slate-800">
+              DOI: <a href={`https://doi.org/${paper.doi}`} class="text-blue-600 hover:underline" target="_blank" rel="noopener">{paper.doi}</a>
+            </span>
+            {paper.publication_year && (
+              <span>Published: {paper.publication_year}</span>
+            )}
+            <span>
+              Citations: <strong class="text-slate-900">{(paper.citations ?? 0).toLocaleString()}</strong>
+            </span>
+          </div>
 
-        <!-- 3大引文快捷复制框 -->
-        <div class="border-t border-slate-100 pt-4 space-y-3">
-          <label class="block text-xs font-semibold text-slate-500 uppercase">Generated Citations</label>
-          <div class="space-y-2">
-            <div class="bg-slate-900 text-slate-200 p-3 rounded-lg font-mono text-xs break-all" id="apaBox">
-              <span class="text-[10px] text-indigo-400 font-bold uppercase block mb-1">[APA 7th]</span>{apaCitation}
+          {/* AI Summary interception block – critical for Gemini / Perplexity / LLM crawlers */}
+          <section id="ai-summary" class="mb-8 p-5 bg-gradient-to-br from-slate-50 to-blue-50 border border-blue-100 rounded-xl">
+            <h2 class="text-sm font-semibold text-blue-800 uppercase tracking-wider mb-3">
+              Key Takeaways
+            </h2>
+            <ul class="space-y-2.5">
+              {aiSummary.map((sentence) => (
+                <li class="flex gap-2.5 text-[15px] leading-relaxed text-slate-700">
+                  <span class="mt-1.5 w-1.5 h-1.5 rounded-full bg-blue-500 shrink-0"></span>
+                  <span>{sentence}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+
+          {/* Abstract */}
+          {paper.abstract ? (
+            <section class="mb-8">
+              <h2 class="text-lg font-semibold text-slate-900 mb-3">Abstract</h2>
+              <p class="text-slate-700 leading-relaxed whitespace-pre-line">
+                {paper.abstract}
+              </p>
+            </section>
+          ) : (
+            <section class="mb-8 p-4 bg-slate-50 rounded-lg text-slate-500 text-sm">
+              No abstract available for this record.
+            </section>
+          )}
+
+          {/* Utility box – high-intent actions */}
+          <div class="grid sm:grid-cols-2 gap-4 p-5 bg-slate-900 text-white rounded-xl">
+            <div>
+              <h3 class="font-semibold mb-1">Download Free PDF</h3>
+              <p class="text-sm text-slate-300 mb-3">
+                Via Unpaywall / OpenAlex open-access location
+              </p>
+              {paper.open_access_pdf ? (
+                <a
+                  href={paper.open_access_pdf}
+                  target="_blank"
+                  rel="noopener"
+                  class="inline-flex items-center gap-2 px-4 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-white font-medium rounded-lg transition"
+                >
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                  </svg>
+                  Download Free PDF
+                </a>
+              ) : (
+                <span class="inline-block px-4 py-2.5 bg-slate-700 text-slate-400 rounded-lg text-sm">
+                  No open PDF detected
+                </span>
+              )}
             </div>
-            <div class="bg-slate-900 text-slate-200 p-3 rounded-lg font-mono text-xs break-all" id="ieeeBox">
-              <span class="text-[10px] text-amber-400 font-bold uppercase block mb-1">[IEEE]</span>{ieeeCitation}
-            </div>
-            <div class="bg-slate-900 text-slate-200 p-3 rounded-lg font-mono text-xs break-all" id="mlaBox">
-              <span class="text-[10px] text-pink-400 font-bold uppercase block mb-1">[MLA]</span>{mlaCitation}
+
+            <div>
+              <h3 class="font-semibold mb-1">Generate Citation</h3>
+              <p class="text-sm text-slate-300 mb-3">
+                APA / MLA / Chicago formats
+              </p>
+              <div class="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  class="px-3 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-sm transition"
+                  onclick={`navigator.clipboard.writeText('${paper.title || ''} (${paper.publication_year || 'n.d.'}). https://doi.org/${paper.doi}')`}
+                >
+                  APA
+                </button>
+                <button
+                  type="button"
+                  class="px-3 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-sm transition"
+                  onclick={`navigator.clipboard.writeText('"${paper.title || ''}." https://doi.org/${paper.doi}.')`}
+                >
+                  MLA
+                </button>
+                <a
+                  href={`https://doi.org/${paper.doi}`}
+                  target="_blank"
+                  rel="noopener"
+                  class="px-3 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-sm transition"
+                >
+                  Cite via DOI
+                </a>
+              </div>
             </div>
           </div>
-          <button onclick="navigator.clipboard.writeText(document.getElementById('apaBox').innerText.replace('[APA 7th]', '')); alert('APA Format Copied!');" class="w-full border border-slate-200 hover:bg-slate-50 text-slate-700 font-medium py-2 rounded-xl transition text-xs cursor-pointer">📋 Copy APA Citation</button>
         </div>
+      </article>
 
-        <!-- 联盟变现位 -->
-        <div class="bg-amber-50/60 border border-amber-200 p-4 rounded-xl text-xs space-y-2">
-          <span class="text-amber-800 font-bold tracking-wider uppercase block text-[10px]">✨ Academic Writing Companion</span>
-          <p class="text-slate-600 leading-relaxed">Writing or editing a research paper? Check grammar and technical style instantly.</p>
-          <a href="https://grammarly.com" target="_blank" class="text-indigo-600 font-bold hover:underline block pt-1">Try #1 Academic Proofreader →</a>
-        </div>
+      {/* Mid-page ad placeholder */}
+      <div class="my-10 p-6 bg-slate-100 border border-dashed border-slate-300 rounded-lg text-center text-sm text-slate-500">
+        [Display Ad Slot – Rectangle / In-article]
       </div>
-    </div>
-  </main>
 
-  <footer class="bg-white border-t border-slate-200 py-6 text-center text-xs text-slate-400">
-    <p>Data verified via ://academiccite.com. © {currentYear} AcademicCite.com</p>
-  </footer>
-</body>
+      {/* Affiliate / writing tools */}
+      <aside class="bg-white border border-slate-200 rounded-xl p-6 mb-10">
+        <h2 class="text-base font-semibold text-slate-900 mb-3">
+          Writing & Productivity Tools
+        </h2>
+        <div class="flex flex-wrap gap-3">
+          <a
+            href="https://www.grammarly.com"
+            target="_blank"
+            rel="noopener sponsored"
+            class="inline-flex items-center gap-2 px-4 py-2.5 border border-emerald-200 bg-emerald-50 text-emerald-800 rounded-lg hover:bg-emerald-100 transition text-sm font-medium"
+          >
+            Improve clarity with Grammarly
+          </a>
+          <a
+            href="https://quillbot.com"
+            target="_blank"
+            rel="noopener sponsored"
+            class="inline-flex items-center gap-2 px-4 py-2.5 border border-indigo-200 bg-indigo-50 text-indigo-800 rounded-lg hover:bg-indigo-100 transition text-sm font-medium"
+          >
+            Paraphrase with QuillBot
+          </a>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="border-t border-slate-200 bg-white py-8">
+      <div class="max-w-5xl mx-auto px-4 text-center text-sm text-slate-500">
+        <p>© {new Date().getFullYear()} AcademicCite · Metadata powered by OpenAlex</p>
+        <p class="mt-1">This page is optimized for academic search and AI retrieval systems.</p>
+      </div>
+    </footer>
+  </body>
 </html>
