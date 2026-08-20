@@ -2,14 +2,12 @@
 /**
  * src/pages/paper/[...doi].astro
  * Production SSR detail page for AcademicCite
- * Handles DOI rest parameter, backend fetch, crawl-budget gating,
- * ScholarlyArticle JSON-LD, AI-summary interception block, and utility actions.
  */
 
-export const prerender = false; // Force SSR for dynamic DOI routes
+export const prerender = false; // 强制 SSR
 
 // ---------------------------------------------------------------------------
-// 1. Extract & normalize DOI from rest parameter
+// 1. 提取并规范化 DOI
 // ---------------------------------------------------------------------------
 const rawParam = Astro.params.doi;
 
@@ -17,7 +15,6 @@ if (!rawParam || typeof rawParam !== 'string' || rawParam.trim().length === 0) {
   return Astro.redirect('/404');
 }
 
-// Rest parameter may contain path separators; reconstruct and decode
 let doi = decodeURIComponent(rawParam)
   .replace(/^https?:\/\/(dx\.)?doi\.org\//i, '')
   .replace(/^doi:/i, '')
@@ -28,7 +25,7 @@ if (!doi || doi.length > 512) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Fetch paper metadata from secure backend
+// 2. 从后端 API 获取论文元数据
 // ---------------------------------------------------------------------------
 interface PaperData {
   doi: string;
@@ -53,7 +50,10 @@ let paper: PaperData = {
 let fetchError: string | null = null;
 
 try {
-  const apiUrl = `https://academiccite.com/api/paper/${encodeURIComponent(doi)}`;
+  // 生产环境请使用 https://api.academiccite.com
+  // 本地开发可临时改为 http://127.0.0.1:3000
+  const apiUrl = `https://api.academiccite.com/api/paper/${encodeURIComponent(doi)}`;
+  
   const res = await fetch(apiUrl, {
     headers: {
       Accept: 'application/json',
@@ -80,9 +80,9 @@ try {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Crawl Budget Throttling Rule
+// 3. 爬取预算节流规则
 // ---------------------------------------------------------------------------
-const currentYear = new Date().getFullYear(); // 2026
+const currentYear = new Date().getFullYear();
 const year = paper.publication_year ?? null;
 const citations = paper.citations ?? 0;
 const hasAbstract = !!(paper.abstract && paper.abstract.trim().length > 30);
@@ -99,7 +99,7 @@ if (
 }
 
 // ---------------------------------------------------------------------------
-// 4. Programmatic 3-sentence AI summary (pre-rendered for LLM scrapers)
+// 4. 程序化生成 3 句 AI Summary（预渲染给 LLM 抓取）
 // ---------------------------------------------------------------------------
 function generateAiSummary(p: PaperData): string[] {
   const title = p.title || 'This scholarly work';
@@ -108,12 +108,12 @@ function generateAiSummary(p: PaperData): string[] {
 
   const sentences: string[] = [];
 
-  // Sentence 1 – title-driven
+  // 句子 1
   sentences.push(
     `This paper, titled “${title}”, presents original research findings relevant to its core academic domain.`
   );
 
-  // Sentence 2 – abstract-driven (first meaningful sentence) or fallback
+  // 句子 2
   if (abs.length > 40) {
     const first = abs.split(/(?<=[.!?])\s+/)[0]?.trim() || abs.slice(0, 140);
     const cleaned = first.endsWith('.') ? first : first + '.';
@@ -124,7 +124,7 @@ function generateAiSummary(p: PaperData): string[] {
     );
   }
 
-  // Sentence 3 – impact / utility
+  // 句子 3
   if (cites > 0) {
     sentences.push(
       `It has accumulated ${cites.toLocaleString()} citations to date, indicating sustained scholarly attention and influence.`
@@ -141,7 +141,7 @@ function generateAiSummary(p: PaperData): string[] {
 const aiSummary = generateAiSummary(paper);
 
 // ---------------------------------------------------------------------------
-// 5. Prepare JSON-LD (ScholarlyArticle)
+// 5. JSON-LD (ScholarlyArticle)
 // ---------------------------------------------------------------------------
 const jsonLd = {
   '@context': 'https://schema.org',
@@ -184,7 +184,7 @@ const pageDescription =
     <title>{pageTitle}</title>
     <meta name="description" content={pageDescription} />
 
-    {/* Crawl-budget / robots control */}
+    {/* 爬取预算控制 */}
     {shouldIndex ? (
       <meta name="robots" content="index, follow, max-image-preview:large" />
     ) : (
@@ -193,15 +193,14 @@ const pageDescription =
 
     <link rel="canonical" href={`https://academiccite.com/paper/${encodeURIComponent(paper.doi)}`} />
 
-    {/* ScholarlyArticle JSON-LD – pre-rendered for AI / Google Scholar */}
+    {/* ScholarlyArticle JSON-LD */}
     <script type="application/ld+json" set:html={JSON.stringify(jsonLd)} />
 
-    {/* Tailwind (assume project already includes it via @astrojs/tailwind or CDN for standalone) */}
     <script src="https://cdn.tailwindcss.com"></script>
   </head>
 
   <body class="bg-slate-50 text-slate-800 antialiased min-h-screen">
-    <!-- Top utility bar -->
+    <!-- 顶部工具栏 -->
     <header class="bg-white border-b border-slate-200 sticky top-0 z-30">
       <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
         <a href="/" class="font-semibold text-slate-900 tracking-tight">
@@ -229,19 +228,19 @@ const pageDescription =
     </header>
 
     <main class="max-w-5xl mx-auto px-4 py-8">
-      {/* Display ad placeholder – top */}
+      {/* 广告位占位 */}
       <div class="mb-8 p-4 bg-slate-100 border border-dashed border-slate-300 rounded-lg text-center text-sm text-slate-500">
         [Display Ad Slot – 728×90 / Responsive]
       </div>
 
-      {/* Error state */}
+      {/* 错误提示 */}
       {fetchError && (
         <div class="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-sm">
           Unable to fully load metadata: {fetchError}. Showing available information.
         </div>
       )}
 
-      {/* Title & core metadata */}
+      {/* 主体内容 */}
       <article class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
         <div class="p-6 sm:p-8">
           <h1 class="text-2xl sm:text-3xl font-bold text-slate-900 leading-tight mb-4">
@@ -260,7 +259,7 @@ const pageDescription =
             </span>
           </div>
 
-          {/* AI Summary interception block – critical for Gemini / Perplexity / LLM crawlers */}
+          {/* AI Summary 拦截区块 */}
           <section id="ai-summary" class="mb-8 p-5 bg-gradient-to-br from-slate-50 to-blue-50 border border-blue-100 rounded-xl">
             <h2 class="text-sm font-semibold text-blue-800 uppercase tracking-wider mb-3">
               Key Takeaways
@@ -275,7 +274,7 @@ const pageDescription =
             </ul>
           </section>
 
-          {/* Abstract */}
+          {/* 摘要 */}
           {paper.abstract ? (
             <section class="mb-8">
               <h2 class="text-lg font-semibold text-slate-900 mb-3">Abstract</h2>
@@ -289,7 +288,7 @@ const pageDescription =
             </section>
           )}
 
-          {/* Utility box – high-intent actions */}
+          {/* 工具箱 */}
           <div class="grid sm:grid-cols-2 gap-4 p-5 bg-slate-900 text-white rounded-xl">
             <div>
               <h3 class="font-semibold mb-1">Download Free PDF</h3>
@@ -303,9 +302,6 @@ const pageDescription =
                   rel="noopener"
                   class="inline-flex items-center gap-2 px-4 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-white font-medium rounded-lg transition"
                 >
-                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                  </svg>
                   Download Free PDF
                 </a>
               ) : (
@@ -324,14 +320,14 @@ const pageDescription =
                 <button
                   type="button"
                   class="px-3 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-sm transition"
-                  onclick={`navigator.clipboard.writeText('${paper.title || ''} (${paper.publication_year || 'n.d.'}). https://doi.org/${paper.doi}')`}
+                  onclick={`navigator.clipboard.writeText('${(paper.title || '').replace(/'/g, "\\'")} (${paper.publication_year || 'n.d.'}). https://doi.org/${paper.doi}')`}
                 >
                   APA
                 </button>
                 <button
                   type="button"
                   class="px-3 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-sm transition"
-                  onclick={`navigator.clipboard.writeText('"${paper.title || ''}." https://doi.org/${paper.doi}.')`}
+                  onclick={`navigator.clipboard.writeText('"${(paper.title || '').replace(/'/g, "\\'")}." https://doi.org/${paper.doi}.')`}
                 >
                   MLA
                 </button>
@@ -349,12 +345,12 @@ const pageDescription =
         </div>
       </article>
 
-      {/* Mid-page ad placeholder */}
+      {/* 广告位 */}
       <div class="my-10 p-6 bg-slate-100 border border-dashed border-slate-300 rounded-lg text-center text-sm text-slate-500">
         [Display Ad Slot – Rectangle / In-article]
       </div>
 
-      {/* Affiliate / writing tools */}
+      {/* 联盟工具 */}
       <aside class="bg-white border border-slate-200 rounded-xl p-6 mb-10">
         <h2 class="text-base font-semibold text-slate-900 mb-3">
           Writing & Productivity Tools
