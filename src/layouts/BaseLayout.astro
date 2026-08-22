@@ -17,6 +17,11 @@ const {
 <!doctype html>
 <html lang="en">
   <head>
+ <!-- 如果不是真正的最终生产上线环境，一律加上 noindex -->
+  {!isProd && <meta name="robots" content="content="noindex, nofollow"" />}
+  
+  <!-- 如果你在测试时 import.meta.env.PROD 已经是 true，你可以直接硬编码一行，测完再删： -->
+  <meta name="robots" content="noindex, nofollow" />
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{title}</title>
